@@ -76,6 +76,9 @@ nubContributors cs@(c:cr) = updateContributions c cnts : nubContributors (filter
 blankLine :: IO ()
 blankLine = putStrLn ""
 
+getInfo :: (String -> IO (Either e b)) -> ([b] -> r) -> [Repo] -> IO r
+getInfo get cleanup = liftM cleanup . mapM (eitherIO . get . repoName)
+
 main :: IO ()
 main = do
     now <- getCurrentTime
@@ -90,9 +93,10 @@ main = do
     printf "Found %d issues and %d contributors\n" (length issues) (length contribs)
     finish <- getCurrentTime
     printf "Done! Took %s\n" . show $ diffUTCTime finish now
-    where getInfo get cleanup repos = liftM cleanup $ mapM (eitherIO . get . repoName) repos
-          getContribs name = printf "Contributors to %s..\n" name >> contributors' githubAuth organization name
-          getIssues name = printf "Open issues of %s..\n" name >> issuesForRepo' githubAuth organization name issueLimitations
-          issueLimitations = []
-          organization = "Cambatv"
+    where getContribs name = do printf "Contributors to %s..\n" name
+                                contributors' githubAuth organization name
+          getIssues name = do printf "Open issues of %s..\n" name
+                              issuesForRepo' githubAuth organization name issueLimitations
+          organization = "evercam"
           saveFileName = "saved.json"
+          issueLimitations = []
