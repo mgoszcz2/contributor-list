@@ -34,7 +34,7 @@ data Options = Options { optQuiet :: Verbosity
                        , optName :: String
                        } deriving (Show)
 
-data Results = Results UTCTime String [MetaInfo Contributor] [MetaInfo Issue] deriving (Show)
+data Results = Results UTCTime String [Repo] [MetaInfo Contributor] [MetaInfo Issue] deriving (Show)
 
 instance Functor MetaInfo where
     fmap fn mi@MetaInfo{..} = mi {metaData = fn metaData}
@@ -59,9 +59,25 @@ instance ToJSON (MetaInfo IssueLabel) where
     toJSON (MetaInfo ent repo (IssueLabel color _ name)) =
         object ["color" .= color, "url" .= labelHtmlUrl ent repo name, "name" .= name]
 
+-- See https://github.com/jwiegley/github/issues/110
+instance ToJSON Repo where
+    toJSON Repo{..} = object[ "url" .= repoHtmlUrl
+                            , "name" .= repoName
+                            , "language" .= repoLanguage
+                            , "issues" .= repoOpenIssues
+                            , "watchers" .= repoWatchers
+                            , "forks" .= repoForks
+                            , "description" .= repoDescription
+                            , "language" .= repoLanguage
+                            ]
+
 instance ToJSON Results where
-    toJSON (Results time org contribs issues) =
-        object ["time" .= time,"name" .= org, "contributors" .= contribs, "issues" .= issues]
+    toJSON (Results time org repos contribs issues) =
+        object [ "time" .= time
+               , "name" .= org
+               , "contributors" .= contribs
+               , "issues" .= issues
+               , "repositories" .= repos]
 
 userUrl :: String -> String
 userUrl = printf "https://github.com/%s/"
@@ -116,7 +132,20 @@ parseOpt = Options <$> flag Verbose Quiet (long "quiet" <> short 'q' <> help "En
 
 parserInfo :: ParserInfo Options
 parserInfo = info (helper <*> parseOpt)
-                  (fullDesc <> header "contributor-list - Get issues and cotributors of an Github entity")
+                  (fullDesc <> header "contributor-list - Get issues and cotributors of a Github entity")
+
+-- Call me crazy but I think view patterns make a lot sense here: They prevent a
+-- pointless 'where' statment while at the same time keeping type signature specialized
+-- preventing accidently mixing the order of argument if I just had 'Int -> Int -> Int -> IO ()'
+printStats :: [Repo] -> [MetaInfo Contributor] -> [MetaInfo Issue] -> IO ()
+printStats (fLength -> r) (fLength -> c) (fLength -> i) = do
+    printf "Found %.1f issues, %.1f contributors and %.1f repositories\n" i c r
+    printf "%.1f contributors/issue (%.1f issues/contributor)\n" (c/i) (i/c)
+    printf "%.1f issues/repository\n" (i/r)
+    printf "%.1f contributors/repository\n" (c/r)
+
+fLength :: [a] -> Double
+fLength = fromIntegral . length
 
 main :: IO ()
 main = do
@@ -134,8 +163,8 @@ main = do
     contribs <- getInfo (getContribs opt) (sortWith metaData . nubContributors . concat) repos
     blankLine
     verbose $ printf "Saving data to '%s'\n" optOutFile
-    BS.writeFile optOutFile . encode $ Results now optName contribs issues
-    verbose $ printf "Found %d issues and %d contributors\n" (length issues) (length contribs)
+    BS.writeFile optOutFile . encode $ Results now optName repos contribs issues
+    verbose $ printStats repos contribs issues
     finish <- getCurrentTime
     verbose $ printf "Done! Took %s\n" . show $ diffUTCTime finish now
     where getContribs Options{..} name = do when (optQuiet == Verbose) $ printf "Contributors to %s..\n" name
