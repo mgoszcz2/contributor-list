@@ -26,6 +26,7 @@ import qualified Data.Text.Lazy.Builder as T
 import qualified Formatting.Internal as FI
 import qualified Formatting.ShortFormatters as F
 
+-- https://existentialtype.wordpress.com/2011/03/15/boolean-blindness/
 data Pretty = Pretty | Uglified deriving (Show, Eq)
 data Verbosity = Verbose | Quiet deriving (Show, Eq)
 data Entity = GetUser | GetOrg deriving (Show, Eq)
@@ -115,7 +116,12 @@ nubContributors cs@(c:cr) = fmap (updateContributions cnts) c : nubContributors 
 sortWith :: (Ord b) => (a -> b) -> [a] -> [a]
 sortWith f = sortBy (compare `on` f)
 
-getInfo :: (Show e) => (String -> IO (Either e [a])) -> ([[MetaInfo a]] -> r) -> [Repo] -> IO r
+-- Adventures of abstraction continue!
+getInfo :: (Show e)
+        => (String -> IO (Either e [a])) -- Function accepting repo name and retriving an array of data
+        -> ([[MetaInfo a]] -> r) -- Function that rganises nested per repo list
+        -> [Repo] -- Repos to use
+        -> IO r
 getInfo get cleanup = liftM cleanup . mapM callGet
     where callGet Repo{..} = liftM (map (MetaInfo (githubOwnerLogin repoOwner) repoName)) . eitherIO $ get repoName
 
@@ -127,6 +133,7 @@ parseOpt = Options <$> flag Verbose Quiet (long "quiet" <> short 'q' <> help "En
                    <*> optional (strOption $ long "file" <> short 'f' <> metavar "FILE" <> help "Output file name (default ENTITY.json)")
                    <*> strArgument (metavar "ENTITY" <> help "Entity (organization/user) name")
 
+-- Retry an IO action while it's return a Left value
 eitherIO :: (Show e) => IO (Either e a) -> IO a
 eitherIO io = do
     res <- retrying policy (const check) io
@@ -150,9 +157,8 @@ printStats (genericLength -> r) (genericLength -> c) (genericLength -> i) = do
     fprint (f % " contributors/issue (" % f % " issues/contributor)\n") (c/i) (i/c)
     fprint (f % " issues/repository\n") (i/r)
     fprint (f % " contributors/repository\n") (c/r)
-    where f :: Format r (Double -> r)
-          f = F.f 1
-          n = F.f 0
+    where f = F.f 1 :: Format r (Double -> r)
+          n = F.f 0 :: Format r (Double -> r)
 
 printIf :: Bool -> Format (IO ()) a -> a
 printIf p m = FI.runFormat m (when p . T.putStrLn . T.toLazyText)
@@ -160,6 +166,7 @@ printIf p m = FI.runFormat m (when p . T.putStrLn . T.toLazyText)
 issueLimitations :: [IssueLimitation]
 issueLimitations = [Open]
 
+-- Given a repo list get all data
 getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [MetaInfo Contributor])
 getResults Options{..} repos =
     (,) <$> getInfo getIssues concat repos
@@ -168,6 +175,7 @@ getResults Options{..} repos =
           getContribs name = verbose ("Contributors to " % F.s) name >> contributors' optAuthKey optName name
           getIssues name = verbose ("Open issues of " % F.s) name >> issuesForRepo' optAuthKey optName name issueLimitations
 
+-- File writing wrapper over getResults
 writeData :: Options -> IO ()
 writeData opt@Options{..} = do
     start <- getCurrentTime
