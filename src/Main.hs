@@ -10,6 +10,7 @@ import Github.Issues
 import Github.Auth
 import Data.Aeson
 import Formatting
+import Control.Retry
 import Data.Time.Clock
 import Options.Applicative
 import Data.Function (on)
@@ -19,11 +20,13 @@ import System.Exit (exitFailure)
 import Control.Monad (liftM, when)
 import Data.List (sortBy, genericLength)
 import Data.Aeson.Encode (encodeToTextBuilder)
+import Data.Aeson.Encode.Pretty (encodePrettyToTextBuilder)
 import qualified Data.Text.Lazy.IO as T
 import qualified Data.Text.Lazy.Builder as T
 import qualified Formatting.Internal as FI
 import qualified Formatting.ShortFormatters as F
 
+data Pretty = Pretty | Uglified deriving (Show, Eq)
 data Verbosity = Verbose | Quiet deriving (Show, Eq)
 data Entity = GetUser | GetOrg deriving (Show, Eq)
 
@@ -34,6 +37,7 @@ data MetaInfo a = MetaInfo { metaEntity :: String
 
 data Options = Options { optQuiet :: Verbosity
                        , optEntity :: Entity
+                       , optPretty :: Pretty
                        , optAuthKey :: Maybe GithubAuth
                        , optOutFile :: Maybe FilePath
                        , optName :: String
@@ -90,19 +94,6 @@ userUrl = formatToString $ "https://github.com/" % F.s % "/"
 labelHtmlUrl :: String -> String -> String -> String
 labelHtmlUrl = formatToString $ "https://github.com/" % F.s % "/" % F.s % "/labels/" % F.s
 
-eitherIO :: (Show e) => IO (Either e a) -> IO a
-eitherIO = eitherIOCnt 1
-
-eitherIOCnt :: (Show e) => Int -> IO (Either e a) -> IO a
-eitherIOCnt cnt io
-    | attempts < cnt = hprint stderr ("Gave up after " % F.d % " attempts!") attempts >> exitFailure
-    | otherwise = do res <- io
-                     case res of
-                          (Right a) -> return a
-                          (Left e) -> do hprint stderr ("Retrying! [" % F.d % "/" % F.d % "] (" % F.sh % ")\n") cnt attempts e
-                                         eitherIOCnt (cnt + 1) io
-    where attempts = 5
-
 getName :: Contributor -> String
 getName (KnownContributor _ _ name _ _ _) = name
 getName (AnonymousContributor _ name) = name
@@ -131,9 +122,20 @@ getInfo get cleanup = liftM cleanup . mapM callGet
 parseOpt :: Parser Options
 parseOpt = Options <$> flag Verbose Quiet (long "quiet" <> short 'q' <> help "Enable quiet mode")
                    <*> flag GetOrg GetUser (long "user" <> short 'u' <> help "Get user data")
+                   <*> flag Uglified Pretty (long "pretty" <> short 'p' <> help "Pretty print json")
                    <*> optional (GithubOAuth <$> strOption (long "key" <> short 'a' <> metavar "OAUTHKEY" <> help "Github OAuth key"))
                    <*> optional (strOption $ long "file" <> short 'f' <> metavar "FILE" <> help "Output file name (default ENTITY.json)")
                    <*> strArgument (metavar "ENTITY" <> help "Entity (organization/user) name")
+
+eitherIO :: (Show e) => IO (Either e a) -> IO a
+eitherIO io = do
+    res <- retrying policy (const check) io
+    case res of
+        Left _ -> hprint stderr "Giving up!\n" >> exitFailure
+        Right a -> return a
+    where policy = exponentialBackoff 500000 <> limitRetries 5
+          check (Right _) = return False
+          check (Left e) = fprint ("Retrying! (" % F.sh % ")\n") e >> return True
 
 parserInfo :: ParserInfo Options
 parserInfo = info (helper <*> parseOpt)
@@ -152,35 +154,38 @@ printStats (genericLength -> r) (genericLength -> c) (genericLength -> i) = do
           f = F.f 1
           n = F.f 0
 
-printIfLn :: Bool -> Format (IO ()) a -> a
-printIfLn p m = FI.runFormat m (when p . T.putStrLn . T.toLazyText)
-
 printIf :: Bool -> Format (IO ()) a -> a
-printIf p m = FI.runFormat m (when p . T.putStr . T.toLazyText)
+printIf p m = FI.runFormat m (when p . T.putStrLn . T.toLazyText)
 
-main :: IO ()
-main = do
-    opt@Options{..} <- execParser parserInfo
-    let verbose = printIfLn (optQuiet == Verbose)
-        blankLine = verbose ""
-        fileName = fromMaybe (optName ++ ".json") optOutFile
+issueLimitations :: [IssueLimitation]
+issueLimitations = [Open]
+
+getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [MetaInfo Contributor])
+getResults Options{..} repos =
+    (,) <$> getInfo getIssues concat repos
+        <*> getInfo getContribs (sortWith metaData . nubContributors . concat) repos
+    where verbose = printIf (optQuiet == Verbose)
+          getContribs name = verbose ("Contributors to " % F.s) name >> contributors' optAuthKey optName name
+          getIssues name = verbose ("Open issues of " % F.s) name >> issuesForRepo' optAuthKey optName name issueLimitations
+
+writeData :: Options -> IO ()
+writeData opt@Options{..} = do
     start <- getCurrentTime
     verbose ("Generating data for " % F.s) optName
-    verbose "Getting repo list.."
-    repos <- eitherIO $ if optEntity == GetOrg
-                           then organizationRepos' optAuthKey optName
-                           else userRepos' optAuthKey optName Public
-    blankLine
-    issues <- getInfo (getIssues opt) concat repos
-    contribs <- getInfo (getContribs opt) (sortWith metaData . nubContributors . concat) repos
-    blankLine
-    verbose ("Saving data to " % F.s) fileName
-    T.writeFile fileName . T.toLazyText . encodeToTextBuilder . toJSON $ Results start optName repos contribs issues
-    when (optQuiet == Verbose) $ printStats repos contribs issues
+    verbose "Getting repo list..\n"
+    repos <- eitherIO $ getRepos optEntity
+    (issues,contribs) <- getResults opt repos
+    verbose ("\nSaving data to " % F.s) fileName
+    writeJson fileName $ Results start optName repos contribs issues
     finish <- getCurrentTime
-    verbose ("Done! Took " % F.s) (show $ diffUTCTime finish start)
-    where getContribs Options{..} name = do printIfLn (optQuiet == Verbose) ("Contributors to " % F.s) name
-                                            contributors' optAuthKey optName name
-          getIssues Options{..} name = do printIfLn (optQuiet == Verbose) ("Open issues of " % F.s) name
-                                          issuesForRepo' optAuthKey optName name issueLimitations
-          issueLimitations = [Open]
+    verbose ("Done! Took " % F.sh) $ diffUTCTime finish start
+    where verbose = printIf (optQuiet == Verbose)
+          fileName = fromMaybe (optName ++ ".json") optOutFile
+          encoder Pretty = encodePrettyToTextBuilder
+          encoder Uglified = encodeToTextBuilder
+          getRepos GetOrg = organizationRepos' optAuthKey optName
+          getRepos GetUser = userRepos' optAuthKey optName Public
+          writeJson name = T.writeFile name . T.toLazyText . encoder optPretty . toJSON
+
+main :: IO ()
+main = writeData =<< execParser parserInfo

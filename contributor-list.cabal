@@ -26,6 +26,7 @@ executable contributor-list
                        time,
                        optparse-applicative,
                        formatting,
+                       retry,
                        text ==1.2.*,
                        aeson-pretty
   hs-source-dirs:      src
