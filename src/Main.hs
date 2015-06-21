@@ -9,15 +9,20 @@ import Github.Repos
 import Github.Issues
 import Github.Auth
 import Data.Aeson
+import Formatting
 import Data.Time.Clock
 import Options.Applicative
-import Data.List (sortBy)
-import Text.Printf (printf)
 import Data.Function (on)
-import Control.Monad (liftM, when)
+import System.IO (stderr)
+import Data.Maybe (fromMaybe)
 import System.Exit (exitFailure)
-import System.IO (hPutStrLn, stderr)
-import qualified Data.ByteString.Lazy as BS
+import Control.Monad (liftM, when)
+import Data.List (sortBy, genericLength)
+import Data.Aeson.Encode (encodeToTextBuilder)
+import qualified Data.Text.Lazy.IO as T
+import qualified Data.Text.Lazy.Builder as T
+import qualified Formatting.Internal as FI
+import qualified Formatting.ShortFormatters as F
 
 data Verbosity = Verbose | Quiet deriving (Show, Eq)
 data Entity = GetUser | GetOrg deriving (Show, Eq)
@@ -30,7 +35,7 @@ data MetaInfo a = MetaInfo { metaEntity :: String
 data Options = Options { optQuiet :: Verbosity
                        , optEntity :: Entity
                        , optAuthKey :: Maybe GithubAuth
-                       , optOutFile :: FilePath
+                       , optOutFile :: Maybe FilePath
                        , optName :: String
                        } deriving (Show)
 
@@ -80,21 +85,21 @@ instance ToJSON Results where
                , "repositories" .= repos]
 
 userUrl :: String -> String
-userUrl = printf "https://github.com/%s/"
+userUrl = formatToString $ "https://github.com/" % F.s % "/"
 
 labelHtmlUrl :: String -> String -> String -> String
-labelHtmlUrl = printf "https://github.com/%s/%s/labels/%s"
+labelHtmlUrl = formatToString $ "https://github.com/" % F.s % "/" % F.s % "/labels/" % F.s
 
-eitherIO :: IO (Either e a) -> IO a
+eitherIO :: (Show e) => IO (Either e a) -> IO a
 eitherIO = eitherIOCnt 1
 
-eitherIOCnt :: Int -> IO (Either e a) -> IO a
+eitherIOCnt :: (Show e) => Int -> IO (Either e a) -> IO a
 eitherIOCnt cnt io
-    | attempts < cnt = hPutStrLn stderr (printf "Gave up after %d attempts!" attempts) >> exitFailure
+    | attempts < cnt = hprint stderr ("Gave up after " % F.d % " attempts!") attempts >> exitFailure
     | otherwise = do res <- io
                      case res of
                           (Right a) -> return a
-                          (Left _) -> do hPutStrLn stderr (printf "Retrying request! (%d/%d)" cnt attempts)
+                          (Left e) -> do hprint stderr ("Retrying! [" % F.d % "/" % F.d % "] (" % F.sh % ")\n") cnt attempts e
                                          eitherIOCnt (cnt + 1) io
     where attempts = 5
 
@@ -119,7 +124,7 @@ nubContributors cs@(c:cr) = fmap (updateContributions cnts) c : nubContributors 
 sortWith :: (Ord b) => (a -> b) -> [a] -> [a]
 sortWith f = sortBy (compare `on` f)
 
-getInfo :: (String -> IO (Either e [a])) -> ([[MetaInfo a]] -> r) -> [Repo] -> IO r
+getInfo :: (Show e) => (String -> IO (Either e [a])) -> ([[MetaInfo a]] -> r) -> [Repo] -> IO r
 getInfo get cleanup = liftM cleanup . mapM callGet
     where callGet Repo{..} = liftM (map (MetaInfo (githubOwnerLogin repoOwner) repoName)) . eitherIO $ get repoName
 
@@ -127,7 +132,7 @@ parseOpt :: Parser Options
 parseOpt = Options <$> flag Verbose Quiet (long "quiet" <> short 'q' <> help "Enable quiet mode")
                    <*> flag GetOrg GetUser (long "user" <> short 'u' <> help "Get user data")
                    <*> optional (GithubOAuth <$> strOption (long "key" <> short 'a' <> metavar "OAUTHKEY" <> help "Github OAuth key"))
-                   <*> strOption (long "file" <> short 'f' <> metavar "FILE" <> help "Output file name" <> value "data.json" <> showDefault)
+                   <*> optional (strOption $ long "file" <> short 'f' <> metavar "FILE" <> help "Output file name (default ENTITY.json)")
                    <*> strArgument (metavar "ENTITY" <> help "Entity (organization/user) name")
 
 parserInfo :: ParserInfo Options
@@ -138,23 +143,30 @@ parserInfo = info (helper <*> parseOpt)
 -- pointless 'where' statment while at the same time keeping type signature specialized
 -- preventing accidently mixing the order of argument if I just had 'Int -> Int -> Int -> IO ()'
 printStats :: [Repo] -> [MetaInfo Contributor] -> [MetaInfo Issue] -> IO ()
-printStats (fLength -> r) (fLength -> c) (fLength -> i) = do
-    printf "Found %.1f issues, %.1f contributors and %.1f repositories\n" i c r
-    printf "%.1f contributors/issue (%.1f issues/contributor)\n" (c/i) (i/c)
-    printf "%.1f issues/repository\n" (i/r)
-    printf "%.1f contributors/repository\n" (c/r)
+printStats (genericLength -> r) (genericLength -> c) (genericLength -> i) = do
+    fprint ("Found " % n % " issues, " % n % " contributors and " % n % " repositories\n") i c r
+    fprint (f % " contributors/issue (" % f % " issues/contributor)\n") (c/i) (i/c)
+    fprint (f % " issues/repository\n") (i/r)
+    fprint (f % " contributors/repository\n") (c/r)
+    where f :: Format r (Double -> r)
+          f = F.f 1
+          n = F.f 0
 
-fLength :: [a] -> Double
-fLength = fromIntegral . length
+printIfLn :: Bool -> Format (IO ()) a -> a
+printIfLn p m = FI.runFormat m (when p . T.putStrLn . T.toLazyText)
+
+printIf :: Bool -> Format (IO ()) a -> a
+printIf p m = FI.runFormat m (when p . T.putStr . T.toLazyText)
 
 main :: IO ()
 main = do
     opt@Options{..} <- execParser parserInfo
-    let verbose = when (optQuiet == Verbose)
-    let blankLine = verbose $ putStr "\n"
-    now <- getCurrentTime
-    verbose $ printf "Generating data for '%s'\n" optName
-    verbose $ putStrLn "Getting repo list.."
+    let verbose = printIfLn (optQuiet == Verbose)
+        blankLine = verbose ""
+        fileName = fromMaybe (optName ++ ".json") optOutFile
+    start <- getCurrentTime
+    verbose ("Generating data for " % F.s) optName
+    verbose "Getting repo list.."
     repos <- eitherIO $ if optEntity == GetOrg
                            then organizationRepos' optAuthKey optName
                            else userRepos' optAuthKey optName Public
@@ -162,13 +174,13 @@ main = do
     issues <- getInfo (getIssues opt) concat repos
     contribs <- getInfo (getContribs opt) (sortWith metaData . nubContributors . concat) repos
     blankLine
-    verbose $ printf "Saving data to '%s'\n" optOutFile
-    BS.writeFile optOutFile . encode $ Results now optName repos contribs issues
-    verbose $ printStats repos contribs issues
+    verbose ("Saving data to " % F.s) fileName
+    T.writeFile fileName . T.toLazyText . encodeToTextBuilder . toJSON $ Results start optName repos contribs issues
+    when (optQuiet == Verbose) $ printStats repos contribs issues
     finish <- getCurrentTime
-    verbose $ printf "Done! Took %s\n" . show $ diffUTCTime finish now
-    where getContribs Options{..} name = do when (optQuiet == Verbose) $ printf "Contributors to %s..\n" name
+    verbose ("Done! Took " % F.s) (show $ diffUTCTime finish start)
+    where getContribs Options{..} name = do printIfLn (optQuiet == Verbose) ("Contributors to " % F.s) name
                                             contributors' optAuthKey optName name
-          getIssues Options{..} name = do when (optQuiet == Verbose) $ printf "Open issues of %s..\n" name
+          getIssues Options{..} name = do printIfLn (optQuiet == Verbose) ("Open issues of " % F.s) name
                                           issuesForRepo' optAuthKey optName name issueLimitations
           issueLimitations = [Open]

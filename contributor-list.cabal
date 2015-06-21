@@ -25,6 +25,8 @@ executable contributor-list
                        aeson,
                        time,
                        optparse-applicative,
-                       bytestring
+                       formatting,
+                       text ==1.2.*,
+                       aeson-pretty
   hs-source-dirs:      src
   default-language:    Haskell2010
