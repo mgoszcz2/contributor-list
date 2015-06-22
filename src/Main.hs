@@ -13,6 +13,7 @@ import Formatting
 import Control.Retry
 import Data.Time.Clock
 import Options.Applicative
+import Control.Concurrent.Async
 import Data.Function (on)
 import System.IO (stderr)
 import Data.Maybe (fromMaybe)
@@ -122,7 +123,7 @@ getInfo :: (Show e)
         -> ([[MetaInfo a]] -> r) -- Function that rganises nested per repo list
         -> [Repo] -- Repos to use
         -> IO r
-getInfo get cleanup = liftM cleanup . mapM callGet
+getInfo get cleanup = liftM cleanup . mapConcurrently callGet
     where callGet Repo{..} = liftM (map (MetaInfo (githubOwnerLogin repoOwner) repoName)) . eitherIO $ get repoName
 
 parseOpt :: Parser Options
@@ -160,8 +161,10 @@ printStats (genericLength -> r) (genericLength -> c) (genericLength -> i) = do
     where f = F.f 1 :: Format r (Double -> r)
           n = F.f 0 :: Format r (Double -> r)
 
+-- Can't use putStrLn here because newline is not atomic :(
+-- It's this or passing a lock through mapConcurrently
 printIf :: Bool -> Format (IO ()) a -> a
-printIf p m = FI.runFormat m (when p . T.putStrLn . T.toLazyText)
+printIf p m = FI.runFormat m (when p . T.putStr . T.toLazyText . (<> T.singleton '\n'))
 
 issueLimitations :: [IssueLimitation]
 issueLimitations = [Open]
@@ -169,6 +172,8 @@ issueLimitations = [Open]
 -- Given a repo list get all data
 getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [MetaInfo Contributor])
 getResults Options{..} repos =
+    -- concurrently (getInfo getIssues concat repos)
+    --              (getInfo getContribs (sortWith metaData . nubContributors . concat) repos)
     (,) <$> getInfo getIssues concat repos
         <*> getInfo getContribs (sortWith metaData . nubContributors . concat) repos
     where verbose = printIf (optQuiet == Verbose)
