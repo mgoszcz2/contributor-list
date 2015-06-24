@@ -21,11 +21,11 @@ executable contributor-list
   -- other-modules:
   -- other-extensions:
   build-depends:       base >=4.7 && <4.8,
-                       github,
+                       github ==0.13.*,
                        aeson,
                        time,
                        optparse-applicative,
-                       formatting,
+                       formatting ==6.2.*,
                        retry,
                        text,
                        aeson-pretty,

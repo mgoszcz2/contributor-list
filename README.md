@@ -6,11 +6,8 @@ contributors and issues, to be loaded by a Github Pages script.
 ### Running
 
 ```sh
-$ sudo apt-get install haskell-platform git
 $ git clone https://github.com/mgoszcz2/contributor-list.git
 $ cd contributor-list
-# Likely needed to use sandboxes on Ubuntu's haskell-platform
-$ cabal update && cabal install cabal-install
 $ cabal sandbox init
 # This will take some time - https://xkcd.com/303/
 $ cabal install --only-dependencies

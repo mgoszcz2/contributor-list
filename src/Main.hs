@@ -123,7 +123,7 @@ getInfo :: (Show e)
         -> ([[MetaInfo a]] -> r) -- Function that rganises nested per repo list
         -> [Repo] -- Repos to use
         -> IO r
-getInfo get cleanup = liftM cleanup . mapConcurrently callGet
+getInfo get cleanup = liftM cleanup . mapM callGet
     where callGet Repo{..} = liftM (map (MetaInfo (githubOwnerLogin repoOwner) repoName)) . eitherIO $ get repoName
 
 parseOpt :: Parser Options
@@ -172,10 +172,8 @@ issueLimitations = [Open]
 -- Given a repo list get all data
 getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [MetaInfo Contributor])
 getResults Options{..} repos =
-    -- concurrently (getInfo getIssues concat repos)
-    --              (getInfo getContribs (sortWith metaData . nubContributors . concat) repos)
     (,) <$> getInfo getIssues concat repos
-        <*> getInfo getContribs (sortWith metaData . nubContributors . concat) repos
+        <*> getInfo getContribs (sortWith metaData . nubContributors . concat) repos --TODO: Reverse and explicit sort
     where verbose = printIf (optQuiet == Verbose)
           getContribs name = verbose ("Contributors to " % F.s) name >> contributors' optAuthKey optName name
           getIssues name = verbose ("Open issues of " % F.s) name >> issuesForRepo' optAuthKey optName name issueLimitations
