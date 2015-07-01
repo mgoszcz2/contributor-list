@@ -10,7 +10,7 @@ import Github.Issues
 import Github.Auth
 import Github.Users
 import Data.Aeson
-import Formattingt
+import Formatting
 import Control.Retry
 import Data.Time.Clock
 import Options.Applicative
