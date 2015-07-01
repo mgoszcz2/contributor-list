@@ -10,45 +10,54 @@ import Github.Issues
 import Github.Auth
 import Github.Users
 import Data.Aeson
+import Data.Monoid
 import Formatting
 import Control.Retry
 import Data.Time.Clock
 import Options.Applicative
 import Data.Function (on)
-import Data.Functor (($>))
 import System.IO (stderr)
-import Data.Maybe (fromMaybe)
 import System.Exit (exitFailure)
 import Control.Monad (liftM, when, join)
 import Data.List (sortBy, genericLength)
 import Data.Aeson.Encode (encodeToTextBuilder)
+import Data.Maybe (fromMaybe, isJust, fromJust)
 import Data.Aeson.Encode.Pretty (encodePrettyToTextBuilder)
 import qualified Data.Text.Lazy.IO as T
 import qualified Data.Text.Lazy.Builder as T
 import qualified Formatting.Internal as FI
 import qualified Formatting.ShortFormatters as F
 
+type Url = String
+type RepoName = String
+type LoginName = String
+type FullName = String
+type Contributions = Int
+
 -- https://existentialtype.wordpress.com/2011/03/15/boolean-blindness/
 data Pretty = Pretty | Uglified deriving (Show, Eq)
 data Verbosity = Verbose | Quiet deriving (Show, Eq)
 data Entity = GetUser | GetOrg deriving (Show, Eq)
+data Anonymity = Anonymous | Known deriving (Show, Eq)
 
 data MetaInfo a = MetaInfo { metaEntity :: String
-                           , metaRepo :: String
+                           , metaRepo :: RepoName
                            , metaData :: a
                            } deriving (Show)
 
 data ContributorData = ContributorData { contribCount :: Int
-                                       , loginName :: String
-                                       , htmlUrl :: String
-                                       , avatarUrl :: Maybe String
-                                       , fullName :: Maybe String
+                                       , loginName :: LoginName
+                                       , htmlUrl :: Url
+                                       , contributedTo :: [RepoName]
+                                       , avatarUrl :: Maybe Url
+                                       , fullName :: Maybe FullName
                                        } deriving (Show)
 
 data Options = Options { optQuiet :: Verbosity
                        , optEntity :: Entity
                        , optPretty :: Pretty
                        , optAuthKey :: Maybe GithubAuth
+                       , jsonPFunc :: Maybe String
                        , optOutFile :: Maybe FilePath
                        , optName :: String
                        } deriving (Show)
@@ -56,18 +65,19 @@ data Options = Options { optQuiet :: Verbosity
 data Results = Results UTCTime
                        String
                        [Repo]
-                       [MetaInfo ContributorData]
+                       [ContributorData]
                        [MetaInfo Issue]
                        deriving (Show)
 
 instance Functor MetaInfo where
     fmap fn mi@MetaInfo{..} = mi {metaData = fn metaData}
 
-instance ToJSON (MetaInfo ContributorData) where
-    toJSON (metaData -> ContributorData{..}) =
+instance ToJSON ContributorData where
+    toJSON ContributorData{..} =
         object [ "avatar" .= avatarUrl
                , "login" .= loginName
                , "count" .= contribCount
+               , "contributed" .= contributedTo
                , "name" .= fullName
                , "url" .= htmlUrl]
 
@@ -104,48 +114,62 @@ instance ToJSON Results where
                , "issues" .= issues
                , "repositories" .= repos]
 
-userUrl :: String -> String
+userUrl :: LoginName -> Url
 userUrl = formatToString $ "https://github.com/" % F.s % "/"
 
-labelHtmlUrl :: String -> String -> String -> String
+labelHtmlUrl :: String -> String -> String -> Url
 labelHtmlUrl = formatToString $ "https://github.com/" % F.s % "/" % F.s % "/labels/" % F.s
 
-nubContributors :: [MetaInfo ContributorData] -> [MetaInfo ContributorData]
-nubContributors [] = []
-nubContributors cs@(c:cr) =
-    newc : nubContributors (filter ((name /=) . loginName . metaData) cr)
-    where newc = (\lc -> lc {contribCount = count}) <$> c
-          name = loginName $ metaData c
-          count = foldl (\rc (metaData -> u) -> if loginName u == name
-                                                  then rc + contribCount u
-                                                  else rc) 0 cs
+getName :: Contributor -> LoginName
+getName (KnownContributor _ _ login _ _ _) = login
+getName (AnonymousContributor _ login) = login
 
-getContributorData :: Options -> MetaInfo Contributor -> IO (MetaInfo ContributorData)
-getContributorData Options{..} md@(MetaInfo {metaData = KnownContributor ccnt avatar login _ _ _}) = do
-    fulln <- fmap detailedOwnerName . eitherIO $ do
-        printIf (optQuiet == Verbose) ("Full name of " % F.s) login
-        userInfoFor' optAuthKey login
-    return $ md $> ContributorData { contribCount = ccnt
-                                   , avatarUrl = pure avatar
-                                   , htmlUrl = userUrl login
-                                   , loginName = login
-                                   , fullName = fulln
-                                   }
-getContributorData _ md@(MetaInfo {metaData = AnonymousContributor ccnt login}) =
-    return $ md $> ContributorData { contribCount = ccnt
-                                   , avatarUrl = Nothing
-                                   , htmlUrl = userUrl login
-                                   , loginName = login
-                                   , fullName = Nothing
-                                   }
+getAvatar :: Contributor -> Maybe Url
+getAvatar (KnownContributor _ avatar _ _ _ _) = pure avatar
+getAvatar (AnonymousContributor _ _) = Nothing
+
+getContributions :: Contributor -> Contributions
+getContributions (KnownContributor ccnt _ _ _ _ _) = ccnt
+getContributions (AnonymousContributor ccnt _) = ccnt
+
+filterContrib :: (String -> String -> Bool) -- Compare function
+              -> MetaInfo Contributor -- Contributor in question
+              -> [MetaInfo Contributor] -- All other contributors
+              -> [MetaInfo Contributor] -- Filtered results
+filterContrib f = filter . on f (getName . metaData)
+
+nubContributors :: Options -> [MetaInfo Contributor] -> IO [ContributorData]
+nubContributors _ [] = return []
+nubContributors opt cs@(md:_) = do
+    fulln <- getFullName opt c
+    let newcs = filterContrib (/=) md cs
+        onlyc = filterContrib (==) md cs
+        ccnt = sum $ map (getContributions . metaData) onlyc
+        contributed = map metaRepo onlyc
+        newc = ContributorData { contribCount = ccnt
+                                , avatarUrl = getAvatar c
+                                , htmlUrl = userUrl $ getName c
+                                , contributedTo = contributed
+                                , loginName = getName c
+                                , fullName = fulln
+                                }
+    (newc :) <$> nubContributors opt newcs
+    where c = metaData md
+
+getFullName :: Options -> Contributor -> IO (Maybe FullName)
+getFullName Options{..} (AnonymousContributor _ _) = return Nothing
+getFullName Options{..} (KnownContributor _ _ name _ _ _) =
+    fmap detailedOwnerName . eitherIO $ do
+        printIf (optQuiet == Verbose) ("Full name of " % F.s) name
+        userInfoFor' optAuthKey name
 
 sortWith :: (Ord b) => (a -> b) -> [a] -> [a]
-sortWith f = sortBy (compare `on` f)
+sortWith = sortBy . on compare
 
 -- Adventures of abstraction continue!
 getInfo :: (Show e)
         => (String -> IO (Either e [a])) -- Function accepting repo name and retriving an array of data
-        -> ([[MetaInfo a]] -> r) -- Function that rganises nested per repo list
+        -> ([[MetaInfo a]] -> r) -- Function that organizes nested per repo list
         -> [Repo] -- Repos to use
         -> IO r
 getInfo get cleanup = liftM cleanup . mapM callGet
@@ -156,6 +180,7 @@ parseOpt = Options <$> flag Verbose Quiet (long "quiet" <> short 'q' <> help "En
                    <*> flag GetOrg GetUser (long "user" <> short 'u' <> help "Get user data")
                    <*> flag Uglified Pretty (long "pretty" <> short 'p' <> help "Pretty print json")
                    <*> optional (GithubOAuth <$> strOption (long "key" <> short 'a' <> metavar "OAUTHKEY" <> help "Github OAuth key"))
+                   <*> optional (strOption $ long "jsonp" <> short 'j' <> metavar "FUNC" <> help "Function to use for JsonP")
                    <*> optional (strOption $ long "file" <> short 'f' <> metavar "FILE" <> help "Output file name (default ENTITY.json)")
                    <*> strArgument (metavar "ENTITY" <> help "Entity (organization/user) name")
 
@@ -196,7 +221,7 @@ issueLimitations :: [IssueLimitation]
 issueLimitations = [Open]
 
 -- Given a repo list get all data
-getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [MetaInfo ContributorData])
+getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [ContributorData])
 getResults opt@Options{..} repos =
     (,) <$> getInfo getIssues concat repos
         <*> join (getInfo getContribs processContribs repos)
@@ -205,9 +230,7 @@ getResults opt@Options{..} repos =
                                 contributors' optAuthKey optName name
           getIssues name = do verbose ("Open issues of " % F.s) name
                               issuesForRepo' optAuthKey optName name issueLimitations
-          processContribs = fmap (reverse
-                                 . sortWith (contribCount . metaData)
-                                 . nubContributors) . mapM (getContributorData opt) . concat
+          processContribs = fmap (reverse . sortWith contribCount) . nubContributors opt . concat
 
 -- File writing wrapper over getResults
 writeData :: Options -> IO ()
@@ -218,6 +241,7 @@ writeData opt@Options{..} = do
     repos <- eitherIO $ getRepos optEntity
     (issues,contribs) <- getResults opt repos
     verbose ("\nSaving data to " % F.s) fileName
+    when (isJust jsonPFunc) . verbose ("Wrapping with " % F.s % " function") $ fromJust jsonPFunc
     writeJson fileName $ Results start optName repos contribs issues
     finish <- getCurrentTime
     verbose ("Done! Took " % F.sh) $ diffUTCTime finish start
@@ -227,7 +251,9 @@ writeData opt@Options{..} = do
           encoder Uglified = encodeToTextBuilder
           getRepos GetOrg = organizationRepos' optAuthKey optName
           getRepos GetUser = userRepos' optAuthKey optName Public
-          writeJson name = T.writeFile name . T.toLazyText . encoder optPretty . toJSON
+          buildJsonP Nothing t = t
+          buildJsonP (Just func) t = T.fromString func <> T.singleton '(' <> t <> T.singleton ')'
+          writeJson name = T.writeFile name . T.toLazyText . buildJsonP jsonPFunc . encoder optPretty . toJSON
 
 main :: IO ()
 main = writeData =<< execParser parserInfo
