@@ -8,17 +8,18 @@ module Main where
 import Github.Repos
 import Github.Issues
 import Github.Auth
+import Github.Users
 import Data.Aeson
-import Formatting
+import Formattingt
 import Control.Retry
 import Data.Time.Clock
 import Options.Applicative
-import Control.Concurrent.Async
 import Data.Function (on)
+import Data.Functor (($>))
 import System.IO (stderr)
 import Data.Maybe (fromMaybe)
 import System.Exit (exitFailure)
-import Control.Monad (liftM, when)
+import Control.Monad (liftM, when, join)
 import Data.List (sortBy, genericLength)
 import Data.Aeson.Encode (encodeToTextBuilder)
 import Data.Aeson.Encode.Pretty (encodePrettyToTextBuilder)
@@ -37,6 +38,13 @@ data MetaInfo a = MetaInfo { metaEntity :: String
                            , metaData :: a
                            } deriving (Show)
 
+data ContributorData = ContributorData { contribCount :: Int
+                                       , loginName :: String
+                                       , htmlUrl :: String
+                                       , avatarUrl :: Maybe String
+                                       , fullName :: Maybe String
+                                       } deriving (Show)
+
 data Options = Options { optQuiet :: Verbosity
                        , optEntity :: Entity
                        , optPretty :: Pretty
@@ -45,17 +53,23 @@ data Options = Options { optQuiet :: Verbosity
                        , optName :: String
                        } deriving (Show)
 
-data Results = Results UTCTime String [Repo] [MetaInfo Contributor] [MetaInfo Issue] deriving (Show)
+data Results = Results UTCTime
+                       String
+                       [Repo]
+                       [MetaInfo ContributorData]
+                       [MetaInfo Issue]
+                       deriving (Show)
 
 instance Functor MetaInfo where
     fmap fn mi@MetaInfo{..} = mi {metaData = fn metaData}
 
-instance ToJSON (MetaInfo Contributor) where
-    toJSON (MetaInfo {metaData = (KnownContributor ccnt avatar username _ _ _)}) =
-        object ["avatar" .= avatar, "login" .= username, "count" .= ccnt, "url" .= userUrl username]
-    toJSON (MetaInfo {metaData = (AnonymousContributor ccnt username)}) =
-        object ["avatar" .= anonUrl, "login" .= username, "count" .= ccnt, "url" .= userUrl username]
-        where anonUrl = "#" :: String
+instance ToJSON (MetaInfo ContributorData) where
+    toJSON (metaData -> ContributorData{..}) =
+        object [ "avatar" .= avatarUrl
+               , "login" .= loginName
+               , "count" .= contribCount
+               , "name" .= fullName
+               , "url" .= htmlUrl]
 
 instance ToJSON (MetaInfo Issue) where
     toJSON mi@(MetaInfo _ repo Issue{..}) =
@@ -96,23 +110,34 @@ userUrl = formatToString $ "https://github.com/" % F.s % "/"
 labelHtmlUrl :: String -> String -> String -> String
 labelHtmlUrl = formatToString $ "https://github.com/" % F.s % "/" % F.s % "/labels/" % F.s
 
-getName :: Contributor -> String
-getName (KnownContributor _ _ name _ _ _) = name
-getName (AnonymousContributor _ name) = name
-
-getContributions :: Contributor -> Int
-getContributions (KnownContributor cnt _ _ _ _ _) = cnt
-getContributions (AnonymousContributor cnt _) = cnt
-
-updateContributions :: Int -> Contributor -> Contributor
-updateContributions new (KnownContributor _ a b c d e) = KnownContributor new a b c d e
-updateContributions new (AnonymousContributor _ a) = AnonymousContributor new a
-
-nubContributors :: [MetaInfo Contributor] -> [MetaInfo Contributor]
+nubContributors :: [MetaInfo ContributorData] -> [MetaInfo ContributorData]
 nubContributors [] = []
-nubContributors cs@(c:cr) = fmap (updateContributions cnts) c : nubContributors (filter ((name /=) . getName . metaData) cr)
-    where cnts = foldl (\rc (metaData -> u) -> if getName u == name then rc + getContributions u else rc) 0 cs
-          name = getName $ metaData c
+nubContributors cs@(c:cr) =
+    newc : nubContributors (filter ((name /=) . loginName . metaData) cr)
+    where newc = (\lc -> lc {contribCount = count}) <$> c
+          name = loginName $ metaData c
+          count = foldl (\rc (metaData -> u) -> if loginName u == name
+                                                  then rc + contribCount u
+                                                  else rc) 0 cs
+
+getContributorData :: Options -> MetaInfo Contributor -> IO (MetaInfo ContributorData)
+getContributorData Options{..} md@(MetaInfo {metaData = KnownContributor ccnt avatar login _ _ _}) = do
+    fulln <- fmap detailedOwnerName . eitherIO $ do
+        printIf (optQuiet == Verbose) ("Full name of " % F.s) login
+        userInfoFor' optAuthKey login
+    return $ md $> ContributorData { contribCount = ccnt
+                                   , avatarUrl = pure avatar
+                                   , htmlUrl = userUrl login
+                                   , loginName = login
+                                   , fullName = fulln
+                                   }
+getContributorData _ md@(MetaInfo {metaData = AnonymousContributor ccnt login}) =
+    return $ md $> ContributorData { contribCount = ccnt
+                                   , avatarUrl = Nothing
+                                   , htmlUrl = userUrl login
+                                   , loginName = login
+                                   , fullName = Nothing
+                                   }
 
 sortWith :: (Ord b) => (a -> b) -> [a] -> [a]
 sortWith f = sortBy (compare `on` f)
@@ -166,17 +191,23 @@ printStats (genericLength -> r) (genericLength -> c) (genericLength -> i) = do
 printIf :: Bool -> Format (IO ()) a -> a
 printIf p m = FI.runFormat m (when p . T.putStr . T.toLazyText . (<> T.singleton '\n'))
 
+-- Default issue limitations
 issueLimitations :: [IssueLimitation]
 issueLimitations = [Open]
 
 -- Given a repo list get all data
-getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [MetaInfo Contributor])
-getResults Options{..} repos =
+getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [MetaInfo ContributorData])
+getResults opt@Options{..} repos =
     (,) <$> getInfo getIssues concat repos
-        <*> getInfo getContribs (sortWith metaData . nubContributors . concat) repos --TODO: Reverse and explicit sort
+        <*> join (getInfo getContribs processContribs repos)
     where verbose = printIf (optQuiet == Verbose)
-          getContribs name = verbose ("Contributors to " % F.s) name >> contributors' optAuthKey optName name
-          getIssues name = verbose ("Open issues of " % F.s) name >> issuesForRepo' optAuthKey optName name issueLimitations
+          getContribs name = do verbose ("Contributors to " % F.s) name
+                                contributors' optAuthKey optName name
+          getIssues name = do verbose ("Open issues of " % F.s) name
+                              issuesForRepo' optAuthKey optName name issueLimitations
+          processContribs = fmap (reverse
+                                 . sortWith (contribCount . metaData)
+                                 . nubContributors) . mapM (getContributorData opt) . concat
 
 -- File writing wrapper over getResults
 writeData :: Options -> IO ()
