@@ -15,6 +15,7 @@ import Formatting
 import Control.Retry
 import Data.Time.Clock
 import Options.Applicative
+import Control.Concurrent.Async
 import Data.Function (on)
 import System.IO (stderr)
 import System.Exit (exitFailure)
@@ -38,7 +39,6 @@ type Contributions = Int
 data Pretty = Pretty | Uglified deriving (Show, Eq)
 data Verbosity = Verbose | Quiet deriving (Show, Eq)
 data Entity = GetUser | GetOrg deriving (Show, Eq)
-data Anonymity = Anonymous | Known deriving (Show, Eq)
 
 data MetaInfo a = MetaInfo { metaEntity :: String
                            , metaRepo :: RepoName
@@ -56,6 +56,7 @@ data ContributorData = ContributorData { contribCount :: Int
 data Options = Options { optQuiet :: Verbosity
                        , optEntity :: Entity
                        , optPretty :: Pretty
+                       , optUseAsync :: Bool
                        , optAuthKey :: Maybe GithubAuth
                        , jsonPFunc :: Maybe String
                        , optOutFile :: Maybe FilePath
@@ -168,17 +169,19 @@ sortWith = sortBy . on compare
 
 -- Adventures of abstraction continue!
 getInfo :: (Show e)
-        => (String -> IO (Either e [a])) -- Function accepting repo name and retriving an array of data
+        => Options
+        -> (String -> IO (Either e [a])) -- Function accepting repo name and retriving an array of data
         -> ([[MetaInfo a]] -> r) -- Function that organizes nested per repo list
         -> [Repo] -- Repos to use
         -> IO r
-getInfo get cleanup = liftM cleanup . mapM callGet
+getInfo Options{..} get cleanup = liftM cleanup . (if optUseAsync then mapConcurrently else mapM) callGet
     where callGet Repo{..} = liftM (map (MetaInfo (githubOwnerLogin repoOwner) repoName)) . eitherIO $ get repoName
 
 parseOpt :: Parser Options
 parseOpt = Options <$> flag Verbose Quiet (long "quiet" <> short 'q' <> help "Enable quiet mode")
                    <*> flag GetOrg GetUser (long "user" <> short 'u' <> help "Get user data")
                    <*> flag Uglified Pretty (long "pretty" <> short 'p' <> help "Pretty print json")
+                   <*> switch (long "async" <> short 's' <> help "Use async requests (experimental)")
                    <*> optional (GithubOAuth <$> strOption (long "key" <> short 'a' <> metavar "OAUTHKEY" <> help "Github OAuth key"))
                    <*> optional (strOption $ long "jsonp" <> short 'j' <> metavar "FUNC" <> help "Function to use for JsonP")
                    <*> optional (strOption $ long "file" <> short 'f' <> metavar "FILE" <> help "Output file name (default ENTITY.json)")
@@ -223,8 +226,8 @@ issueLimitations = [Open]
 -- Given a repo list get all data
 getResults :: Options -> [Repo] -> IO ([MetaInfo Issue], [ContributorData])
 getResults opt@Options{..} repos =
-    (,) <$> getInfo getIssues concat repos
-        <*> join (getInfo getContribs processContribs repos)
+    (,) <$> getInfo opt getIssues concat repos
+        <*> join (getInfo opt getContribs processContribs repos)
     where verbose = printIf (optQuiet == Verbose)
           getContribs name = do verbose ("Contributors to " % F.s) name
                                 contributors' optAuthKey optName name

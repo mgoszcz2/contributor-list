@@ -34,6 +34,7 @@ Available options:
   -q,--quiet               Enable quiet mode
   -u,--user                Get user data
   -p,--pretty              Pretty print json
+  -s,--async               Use async requests (experimental)
   -a,--key OAUTHKEY        Github OAuth key
   -j,--jsonp FUNC          Function to use for JsonP
   -f,--file FILE           Output file name (default ENTITY.json)
