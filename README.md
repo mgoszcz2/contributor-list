@@ -26,7 +26,8 @@ You shoud just select the `public_repo` scope (unless you want everyone to know 
 contributor-list - Get issues and cotributors of a Github entity
 
 Usage: contributor-list [-q|--quiet] [-u|--user] [-p|--pretty]
-                        [-a|--key OAUTHKEY] [-f|--file FILE] ENTITY
+                        [-a|--key OAUTHKEY] [-j|--jsonp FUNC] [-f|--file FILE]
+                        ENTITY
 
 Available options:
   -h,--help                Show this help text
@@ -34,6 +35,7 @@ Available options:
   -u,--user                Get user data
   -p,--pretty              Pretty print json
   -a,--key OAUTHKEY        Github OAuth key
+  -j,--jsonp FUNC          Function to use for JsonP
   -f,--file FILE           Output file name (default ENTITY.json)
   ENTITY                   Entity (organization/user) name
 ```
